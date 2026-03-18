@@ -91,12 +91,11 @@ def is_housekeeping_model(model: str | None) -> bool:
     return "haiku" in model.lower()
 
 
-def fake_haiku_response(body: JsonDict) -> tuple[str, JsonDict]:
+def fake_haiku_response(model: str) -> tuple[str, JsonDict]:
     """Build a fake Anthropic-shaped response for haiku background requests.
 
     Claude Code fires haiku requests for housekeeping (summaries, titles, etc.).
     These would queue behind real requests in LM Studio, so we fake them instantly."""
-    model: str = body.get("model", DEFAULT_MODEL)
     msg_id: str = f"msg_{uuid.uuid4().hex[:24]}"
 
     return "json", {
@@ -156,7 +155,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         # Haiku → always fake as non-streaming JSON (streaming fake hangs Claude Code)
         if is_housekeeping_model(model):
             log(f"Haiku ({model}) → fake JSON")
-            _, data = fake_haiku_response({"stream": False, "model": model})
+            _, data = fake_haiku_response(model or DEFAULT_MODEL)
             self._json_response(200, data)
             self.close_connection = True
             return
