@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Thin middleware between Claude Code and LM Studio.
+Thin middleware between Claude Code and LM Studio (requires Python 3.14+).
+
 Handles known issues that cause hangs:
 1. Haiku background requests → fake instant responses
 2. Token counting endpoint → fake responses
@@ -18,29 +19,45 @@ import sys
 import uuid
 import threading
 from datetime import datetime
+from typing import Any
 
+# --- Type aliases ---
+JsonDict = dict[str, Any]
+
+# --- Constants ---
 LM_STUDIO = "http://localhost:1234"
 PORT = 4000
+PROXY_TIMEOUT_GET: int = 30
+PROXY_TIMEOUT_POST: int = 600
+STREAM_CHUNK_SIZE: int = 4096
+DEFAULT_MODEL: str = "claude-haiku-4-5-20251001"
+DEFAULT_MAX_TOKENS: int = 4096
+MIN_BOOSTED_TOKENS: int = 16384
+# Claude Code expects token counts — these are ignored but must be present
+FAKE_INPUT_TOKENS: int = 10
+FAKE_OUTPUT_TOKENS: int = 1
+MAX_TOKENS_MULTIPLIER: int = 3
 
 
-def ts():
+def ts() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
 
-def log(msg):
+def log(msg: str) -> None:
     sys.stderr.write(f"[{ts()}] {msg}\n")
     sys.stderr.flush()
 
 
-def rewrite_image_tool_results(body):
+def rewrite_image_tool_results(body: JsonDict) -> int:
     """Move images from inside tool_result.content arrays to the surrounding user message.
+
     LM Studio rejects image blocks inside tool_result arrays but accepts them
     as standalone content blocks in the same user message."""
-    count = 0
+    count: int = 0
     for msg in body.get("messages", []):
         if msg.get("role") != "user" or not isinstance(msg.get("content"), list):
             continue
-        new_content = []
+        new_content: list[JsonDict] = []
         for block in msg["content"]:
             if block.get("type") != "tool_result":
                 new_content.append(block)
@@ -49,8 +66,8 @@ def rewrite_image_tool_results(body):
             if not isinstance(inner, list):
                 new_content.append(block)
                 continue
-            extracted = []
-            kept = []
+            extracted: list[JsonDict] = []
+            kept: list[JsonDict] = []
             for item in inner:
                 if item.get("type") == "image":
                     extracted.append(item)
@@ -68,36 +85,18 @@ def rewrite_image_tool_results(body):
     return count
 
 
-def is_housekeeping_model(model):
+def is_housekeeping_model(model: str | None) -> bool:
     if not model:
         return False
-    m = model.lower()
-    return "haiku" in m
+    return "haiku" in model.lower()
 
 
-def fake_haiku_response(body):
-    is_stream = body.get("stream", False)
-    model = body.get("model", "claude-haiku-4-5-20251001")
-    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+def fake_haiku_response(model: str) -> tuple[str, JsonDict]:
+    """Build a fake Anthropic-shaped response for haiku background requests.
 
-    if is_stream:
-        events = [
-            {"type": "message_start", "message": {
-                "id": msg_id, "type": "message", "role": "assistant",
-                "model": model, "content": [], "stop_reason": None,
-                "stop_sequence": None, "usage": {"input_tokens": 10, "output_tokens": 5},
-            }},
-            {"type": "content_block_start", "index": 0,
-             "content_block": {"type": "text", "text": ""}},
-            {"type": "content_block_delta", "index": 0,
-             "delta": {"type": "text_delta", "text": "OK"}},
-            {"type": "content_block_stop", "index": 0},
-            {"type": "message_delta",
-             "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-             "usage": {"output_tokens": 1}},
-            {"type": "message_stop"},
-        ]
-        return "stream", events
+    Claude Code fires haiku requests for housekeeping (summaries, titles, etc.).
+    These would queue behind real requests in LM Studio, so we fake them instantly."""
+    msg_id: str = f"msg_{uuid.uuid4().hex[:24]}"
 
     return "json", {
         "id": msg_id,
@@ -107,24 +106,24 @@ def fake_haiku_response(body):
         "content": [{"type": "text", "text": "OK"}],
         "stop_reason": "end_turn",
         "stop_sequence": None,
-        "usage": {"input_tokens": 10, "output_tokens": 1},
+        "usage": {"input_tokens": FAKE_INPUT_TOKENS, "output_tokens": FAKE_OUTPUT_TOKENS},
     }
 
 
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
+    def log_message(self, format: str, *args: Any) -> None:
         pass  # suppress default logging, we use our own
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         if self.path == "/health":
             self._json_response(200, {"status": "ok"})
             return
         log(f"GET {self.path} → LM Studio")
         try:
-            url = f"{LM_STUDIO}{self.path}"
+            url: str = f"{LM_STUDIO}{self.path}"
             req = urllib.request.Request(url, method="GET")
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = resp.read()
+            with urllib.request.urlopen(req, timeout=PROXY_TIMEOUT_GET) as resp:
+                data: bytes = resp.read()
                 self.send_response(resp.status)
                 self.send_header("Content-Type", resp.headers.get("Content-Type", "application/json"))
                 self.end_headers()
@@ -133,10 +132,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             log(f"GET {self.path} error: {e}")
             self._json_response(404, {"error": str(e)})
 
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        raw = self.rfile.read(length)
-        path = self.path
+    def do_POST(self) -> None:
+        length: int = int(self.headers.get("Content-Length", 0))
+        raw: bytes = self.rfile.read(length)
+        path: str = self.path
 
         # Token counting → fake
         if "count_tokens" in path:
@@ -145,30 +144,31 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return
 
         try:
-            body = json.loads(raw)
+            body: JsonDict = json.loads(raw)
         except json.JSONDecodeError:
             self._json_response(400, {"error": "Invalid JSON"})
             return
 
-        model = body.get("model", "")
-        is_stream = body.get("stream", False)
+        model: str = body.get("model", "")
+        is_stream: bool = body.get("stream", False)
 
         # Haiku → always fake as non-streaming JSON (streaming fake hangs Claude Code)
         if is_housekeeping_model(model):
             log(f"Haiku ({model}) → fake JSON")
-            _, data = fake_haiku_response({"stream": False, "model": model})
+            _, data = fake_haiku_response(model or DEFAULT_MODEL)
             self._json_response(200, data)
             self.close_connection = True
             return
 
         # Relocate images out of tool_results (LM Studio compat)
-        img_count = rewrite_image_tool_results(body)
+        img_count: int = rewrite_image_tool_results(body)
         if img_count:
             log(f"Relocated {img_count} image(s) from tool_result → user message")
 
-        # Boost max_tokens for thinking models
-        orig_max = body.get("max_tokens", 4096)
-        body["max_tokens"] = max(orig_max * 3, 16384)
+        # Triple max_tokens — local models undercount tokens vs Claude, so they
+        # hit the limit and truncate output well before the logical end
+        orig_max: int = body.get("max_tokens", DEFAULT_MAX_TOKENS)
+        body["max_tokens"] = max(orig_max * MAX_TOKENS_MULTIPLIER, MIN_BOOSTED_TOKENS)
         raw = json.dumps(body).encode()
 
         log(f"→ LM Studio | model={model} stream={is_stream} "
@@ -176,7 +176,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             f"max_tokens={orig_max}→{body['max_tokens']}")
 
         # Forward to LM Studio
-        url = f"{LM_STUDIO}{path}"
+        url: str = f"{LM_STUDIO}{path}"
         req = urllib.request.Request(url, data=raw, method="POST")
         req.add_header("Content-Type", "application/json")
         for k in self.headers:
@@ -184,7 +184,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 req.add_header(k, self.headers[k])
 
         try:
-            resp = urllib.request.urlopen(req, timeout=600)
+            resp = urllib.request.urlopen(req, timeout=PROXY_TIMEOUT_POST)
         except Exception as e:
             log(f"LM Studio error: {e}")
             self._json_response(502, {
@@ -195,19 +195,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         if is_stream:
             self.send_response(200)
-            ct = resp.headers.get("Content-Type", "text/event-stream")
+            ct: str = resp.headers.get("Content-Type", "text/event-stream")
             self.send_header("Content-Type", ct)
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
             self.end_headers()
             try:
                 while True:
-                    chunk = resp.read(4096)
+                    chunk: bytes = resp.read(STREAM_CHUNK_SIZE)
                     if not chunk:
                         break
                     self.wfile.write(chunk)
                     self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
+            except BrokenPipeError, ConnectionResetError:
                 log("Client disconnected during stream")
             except Exception as e:
                 log(f"Stream error: {e}")
@@ -224,35 +224,24 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(data)
             log("Response complete")
 
-    def _json_response(self, code, data):
-        body = json.dumps(data).encode()
+    def _json_response(self, code: int, data: JsonDict) -> None:
+        body: bytes = json.dumps(data).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_sse_events(self, events):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        for evt in events:
-            self.wfile.write(f"event: {evt['type']}\ndata: {json.dumps(evt)}\n\n".encode())
-        self.wfile.flush()
-        self.close_connection = True
-
 
 class ThreadedHTTPServer(http.server.HTTPServer):
-    allow_reuse_address = True
+    allow_reuse_address: bool = True
 
-    def process_request(self, request, client_address):
+    def process_request(self, request: Any, client_address: tuple[str, int]) -> None:
         t = threading.Thread(target=self._handle, args=(request, client_address))
         t.daemon = True
         t.start()
 
-    def _handle(self, request, client_address):
+    def _handle(self, request: Any, client_address: tuple[str, int]) -> None:
         try:
             self.finish_request(request, client_address)
         except Exception:

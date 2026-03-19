@@ -39,6 +39,16 @@ except: pass
         return
     fi
 
+    if [ -n "$loaded_ctx" ] && [ "$loaded_ctx" != "0" ]; then
+        read -rp "[local_claude] $model is loaded with ctx=$loaded_ctx instead of $CONTEXT_LENGTH. Reload with ctx=$CONTEXT_LENGTH? [Y/n] " answer
+    else
+        read -rp "[local_claude] $model is not loaded. Load it with ctx=$CONTEXT_LENGTH? [Y/n] " answer
+    fi
+    if [[ "$answer" =~ ^[Nn] ]]; then
+        echo "[local_claude] Aborted."
+        exit 1
+    fi
+
     echo "[local_claude] Loading $model (ctx=$CONTEXT_LENGTH)..."
     curl -s -X POST "$LM_STUDIO/api/v1/models/load" \
         -H "Content-Type: application/json" \
@@ -70,16 +80,30 @@ if [ "$1" = "--stop" ]; then
 fi
 
 # --- Start proxy if not running ---
+STARTED_PROXY=false
+
+cleanup() {
+    if $STARTED_PROXY && [ -n "$PROXY_PID" ] && kill -0 $PROXY_PID 2>/dev/null; then
+        echo ""
+        echo "[local_claude] Stopping proxy (pid=$PROXY_PID)..."
+        kill $PROXY_PID 2>/dev/null
+        wait $PROXY_PID 2>/dev/null
+    fi
+}
+trap cleanup EXIT
+
 start_proxy() {
     if lsof -ti :$PROXY_PORT >/dev/null 2>&1; then
-        echo "[local_claude] Proxy already running on :$PROXY_PORT"
-        return
+        echo "[local_claude] Killing stale proxy on :$PROXY_PORT..."
+        kill $(lsof -ti :$PROXY_PORT) 2>/dev/null
+        sleep 0.5
     fi
     echo "[local_claude] Starting proxy on :$PROXY_PORT..."
-    python3 "$SCRIPT_DIR/proxy.py" &
+    uv run --project "$SCRIPT_DIR" python "$SCRIPT_DIR/proxy.py" &
     PROXY_PID=$!
     sleep 1
     if kill -0 $PROXY_PID 2>/dev/null; then
+        STARTED_PROXY=true
         echo "[local_claude] Proxy started (pid=$PROXY_PID)"
     else
         echo "[local_claude] WARNING: Proxy failed to start, falling back to direct mode"
@@ -96,5 +120,5 @@ echo ""
 
 HOME="$LOCAL_HOME" \
 ANTHROPIC_BASE_URL="$PROXY" \
-ANTHROPIC_API_KEY="lmstudio" \
+ANTHROPIC_AUTH_TOKEN="lmstudio" \
 claude --model "$CLAUDE_MODEL" "$@"

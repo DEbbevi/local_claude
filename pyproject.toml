@@ -1,0 +1,5 @@
+[project]
+name = "local-claude"
+version = "0.1.0"
+description = "Middleware between Claude Code and LM Studio"
+requires-python = ">=3.14"
