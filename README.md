@@ -20,7 +20,15 @@ cd local_claude
 ./local_claude
 ```
 
-That's it. The script uses `uv` to automatically manage Python and dependencies — no virtual env or `pip install` needed.
+3. (Optional) To run `local_claude` from any directory, symlink it into your PATH:
+
+```bash
+sudo ln -s "$(pwd)/local_claude" /usr/local/bin/local_claude
+```
+
+Then just run `local_claude` from anywhere.
+
+The script uses `uv` to automatically manage Python and dependencies — no virtual env or `pip install` needed.
 
 It will load your model in LM Studio, start a compatibility proxy, and launch Claude Code pointed at it.
 
